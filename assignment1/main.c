@@ -167,7 +167,7 @@ void add_history(const char *cmd){
     }
 
     // Store command
-    char *stor = malloc(strlen(cmd));
+    char *stor = malloc(strlen(cmd)+1);
     strcpy(stor, cmd);
     history[histlen++] = stor;
 }
