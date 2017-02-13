@@ -5,6 +5,9 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
+
+#define PROMPT "choong-sh>"
 
 const int CMD_LEN_MAX = 2048;
 
@@ -15,49 +18,31 @@ const int ARG_MAX = 100;
 const int PATH_LEN_MAX = 1024;
 const char *PATH = "PATH";
 const char *PATH_TOK = ":";
+const char *HOME = "HOME";
 
-int search(char *name){
-    // Get PATH
-    char *path = getenv(PATH);
-    if(path == NULL){
-        fprintf(stderr, "no PATH\n");
-        return -1;
-    }
+const int TIME_LEN_MAX = 64;
 
-    char program[PATH_LEN_MAX];
+static int histlen = 0;
+static int histsize = 0;
+static char **history = NULL;
 
-    // Search through PATH
-    char *tok = strtok(path, PATH_TOK);
-    while(tok != NULL){
-        if(strlen(tok) + strlen(name) + 2 > PATH_LEN_MAX){
-            fprintf(stderr, "path is too long\n");
-            return -2;
-        }
-        // Prepare path
-        strcpy(program, tok);
-        strcat(program, "/");
-        strcat(program, name);
-        // Check path
-        int ret = access(program, X_OK);
-        if(ret == 0){
-            // Found program
-            strcpy(name, program);
-            return 0;
-        }
-        // Try again
-        tok = strtok(NULL, PATH_TOK);
-    }
-    // Did not find program
-    return 1;
+void timeval_str(struct timeval tv, char *buff){
+    time_t nowtime;
+    struct tm *nowtm;
+    char tmbuf[TIME_LEN_MAX];
+
+    nowtime = tv.tv_sec;
+    nowtm = localtime(&nowtime);
+    strftime(tmbuf, sizeof(tmbuf), "%Y-%m-%d %H:%M:%S", nowtm);
+    snprintf(buff, TIME_LEN_MAX, "%s.%06d", tmbuf, tv.tv_usec);
 }
 
 int external(const char *path, char **args){
-    printf("path: %s\n", path);
-
+    // Fork process
     pid_t pid = fork();
 
     if(pid == 0){
-        // Child
+        // Child, execute program
         int err = execvp(path, args);
         // we shouldn't be here
         fprintf(stderr, "execl error %d %d %s\n", err, errno, strerror(errno));
@@ -77,10 +62,113 @@ int external(const char *path, char **args){
         fprintf(stderr, "waitpid error %d\n", wpid);
     }
 
-    return 0;
+    // capture exit status
+    int ret = 0;
+    if(WIFEXITED(wstatus)){
+        ret = WEXITSTATUS(wstatus);
+        struct rusage usage;
+        if(getrusage(RUSAGE_CHILDREN, &usage) != 0){
+            fprintf(stderr, "getrusage error %d %s\n", errno, strerror(errno));
+            return ret;
+        }
+
+        printf("** STATS for %s **\n", path);
+
+        printf("user CPU time used: %ld.%06d sec\n", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
+        printf("system CPU time used: %ld.%06d sec\n", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
+
+        printf("maximum resident set size: %ld kB\n",        usage.ru_maxrss);
+//        printf("integral shared memory size: %ld\n",      usage.ru_ixrss);
+//        printf("integral unshared data size: %ld\n",      usage.ru_idrss);
+//        printf("integral unshared stack size: %ld\n",     usage.ru_isrss);
+        printf("page reclaims (soft page faults): %ld\n", usage.ru_minflt);
+        printf("page faults (hard page faults): %ld\n",   usage.ru_majflt);
+//        printf("swaps: %ld\n",                            usage.ru_nswap);
+        printf("block input operations: %ld\n",           usage.ru_inblock);
+        printf("block output operations: %ld\n",          usage.ru_oublock);
+//        printf("IPC messages sent: %ld\n",                usage.ru_msgsnd);
+//        printf("IPC messages received: %ld\n",            usage.ru_msgrcv);
+//        printf("signals received: %ld\n",                 usage.ru_nsignals);
+        printf("voluntary context switches: %ld\n",       usage.ru_nvcsw);
+        printf("involuntary context switches: %ld\n",     usage.ru_nivcsw);
+    }
+
+    return ret;
+}
+
+int search(char *name){
+    if(strlen(name) == 0)
+        return 2;
+
+    // Try path verbatim
+    if(name[0] == '/' || name[0] == '.'){
+        int ret = access(name, X_OK);
+        if(ret == 0){
+            return 0;
+        }
+    }
+
+    // Get PATH
+    const char *path = getenv(PATH);
+    if(path == NULL){
+        fprintf(stderr, "no PATH\n");
+        return -1;
+    }
+    char pathbuff[PATH_LEN_MAX];
+    strcpy(pathbuff, path);
+
+    // Search through PATH
+    char program[PATH_LEN_MAX];
+    char *tok = strtok(pathbuff, PATH_TOK);
+
+    while(tok != NULL){
+        if(strlen(tok) + strlen(name) + 2 > PATH_LEN_MAX){
+            fprintf(stderr, "path is too long\n");
+            return -2;
+        }
+
+        // Prepare path
+        strcpy(program, tok);
+        strcat(program, "/");
+        strcat(program, name);
+
+        // Check path
+        int ret = access(program, X_OK);
+        if(ret == 0){
+            // Found program
+            strcpy(name, program);
+            return 0;
+        }
+        // Try next path
+        tok = strtok(NULL, PATH_TOK);
+    }
+
+    // Did not find program
+    return 1;
+}
+
+void add_history(const char *cmd){
+    if(histlen + 1 > histsize){
+        histsize = histsize + 100;
+        // New buffer
+        char **tmp = malloc(histsize * sizeof(const char *));
+        // Copy
+        for(int i = 0; i < histlen; ++i){
+            tmp[i] = history[i];
+        }
+        free(history);
+        history = tmp;
+    }
+
+    // Store command
+    char *stor = malloc(strlen(cmd));
+    strcpy(stor, cmd);
+    history[histlen++] = stor;
 }
 
 int process(const char *input, int *status){
+    *status = 0;
+    if(strlen(input) == 0) return 0;
 
     char argbuff[CMD_LEN_MAX];
     strcpy(argbuff, input);
@@ -94,10 +182,7 @@ int process(const char *input, int *status){
     int quote = 0;
 
     for(int i = 0; i < len; ++i){
-        if(argbuff[i] == '\n'){
-            argbuff[i] = 0;          // Insert terminator
-            break;
-        } else if(argbuff[i] == '"'){
+        if(argbuff[i] == '"'){
             // Hit double quote
             if(quote == 0){
                 // Enter quote mode
@@ -118,19 +203,22 @@ int process(const char *input, int *status){
             base = argbuff + i + 1;  // Set next arg base
         }
     }
-    if(base != argbuff + len - 1)
+    if(base != argbuff + len)
         args[argn++] = base;    // Push last arg
 
     args[argn] = 0; // terminate arg list
-    *status = 0;
     const char *cmd = args[0];
 
+    // debug
 //    printf("input '%s'\n", input);
 //    printf("argn %d\n", argn);
 //    for(int i = 0; i < argn; ++i)
 //        printf("arg %d: '%s'\n", i, args[i]);
 
+    int savehist = 1;
+
     // Handle command
+    int ret = 0;
     if(strcmp(cmd, "exit") == 0){
         // Exit shell
         *status = 1;
@@ -148,7 +236,19 @@ int process(const char *input, int *status){
     } else if(strcmp(cmd, "cd") == 0){
         if(argn > 1){
             // Change directory
-            chdir(args[1]);
+            if(strcmp(args[1], "~") == 0){
+                // Home directory
+                const char *home = getenv(HOME);
+                if(home == NULL){
+                    fprintf(stderr, "no HOME\n");
+                    return -1;
+                }
+                printf("%s\n", home);
+                chdir(home);
+
+            } else {
+                chdir(args[1]);
+            }
         }
 
     } else if(strcmp(cmd, "pwd") == 0){
@@ -157,30 +257,86 @@ int process(const char *input, int *status){
         getcwd(buffer, sizeof(buffer));
         printf("%s\n", buffer);
 
+    } else if(strcmp(cmd, "history") == 0){
+        savehist = 0;
+        for(int i = 0; i < histlen; ++i){
+            printf("%d\t%s\n", i, history[i]);
+        }
+
+    } else if(strcmp(cmd, "!!") == 0){
+        savehist = 0;
+        if(histlen > 0){
+            const char *prev = history[histlen - 1];
+            printf("%s\n", prev);
+            return process(prev, status);
+        } else {
+            printf("no history!\n");
+        }
+
+    } else if(cmd[0] == '!'){
+        savehist = 0;
+        int num = atoi(cmd+1);
+        if(histlen > num){
+            const char *prev = history[num];
+            printf("%s\n", prev);
+            return process(prev, status);
+        } else {
+            printf("not in history!\n");
+        }
+
+    } else if(strcmp(cmd, "help") == 0){
+        printf("exit - exit the shell\n");
+        printf("echo - echo arguments\n");
+        printf("cd - change working directory\n");
+        printf("pwd - print working directory\n");
+        printf("history - print history\n");
+        printf("!! - run last command in history\n");
+        printf("!n - run nth command in history\n");
+
     } else {
         // External program
         char path[PATH_LEN_MAX];
         strcpy(path, cmd);
         // Search for program
-        int ret = search(path);
-        if(ret == 0){
-            *status = 3;
-            // Call external program
-            return external(path, args);
-        } else if(ret < 0){
+        int stat = search(path);
+        if(stat < 0){
             // error
             *status = 4;
+        } else if(stat > 0){
+            // Program not found
+            *status = 2;
+        } else {
+            // Call external program
+            *status = 3;
+            ret = external(path, args);
         }
-        // Program not found
-        *status = 2;
     }
-    return 0;
+
+    if(savehist){
+        // format command for history
+        char cmdbuff[CMD_LEN_MAX];
+        cmdbuff[0] = 0;
+        for(int i = 0; i < argn; ++i){
+            strcat(cmdbuff, args[i]);
+            strcat(cmdbuff, " ");
+        }
+        cmdbuff[strlen(cmdbuff)-1] = 0;
+        add_history(cmdbuff);
+    }
+
+    return ret;
+}
+
+void sig_handler(int sig){
+//    printf("sigint caught\n");
+//    fprintf(stdin, "\n");
 }
 
 int main(int argc, const char **argv){
-
-    char cmd[CMD_LEN_MAX];
     int status = 0;
+    char cmd[CMD_LEN_MAX];
+
+//    signal(SIGINT, sig_handler);
 
     while(1){
         // First check stdin
@@ -191,7 +347,7 @@ int main(int argc, const char **argv){
         }
 
         // Write prompt
-        printf("choong-sh> ");
+        printf(PROMPT " ");
 
         // Read line
         if(fgets(cmd, CMD_LEN_MAX, stdin) == NULL){
@@ -201,12 +357,21 @@ int main(int argc, const char **argv){
             continue;
         }
 
+        // first newline becomes a terminator
+        for(int i = 0; i < strlen(cmd); ++i){
+            if(cmd[i] == '\n'){
+                cmd[i] = 0;
+                break;
+            }
+        }
+
         // Process input
         int ret = process(cmd, &status);
 //        printf("status %d\n", status);
 
         if(status == 0){
             // internal command
+            continue;
         } else if(status == 1){
             // exit
             break;
@@ -218,6 +383,11 @@ int main(int argc, const char **argv){
             printf("return: %d\n", ret);
         }
     }
+
+    for(int i = 0; i < histlen; ++i){
+        free(history[i]);
+    }
+    free(history);
 
     return 0;
 }
