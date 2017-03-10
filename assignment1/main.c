@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
 #define PROMPT "choong-sh>"
 
@@ -21,6 +23,8 @@ const char *PATH_TOK = ":";
 const char *HOME = "HOME";
 
 const int TIME_LEN_MAX = 64;
+
+static int debug = 1;
 
 static int histlen = 0;
 static int histsize = 0;
@@ -72,25 +76,27 @@ int external(const char *path, char **args){
             return ret;
         }
 
-        printf("** STATS for %s **\n", path);
+        if(debug){
+            printf("** STATS for %s **\n", path);
 
-        printf("user CPU time used: %ld.%06d sec\n", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
-        printf("system CPU time used: %ld.%06d sec\n", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
+            printf("user CPU time used: %ld.%06d sec\n", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
+            printf("system CPU time used: %ld.%06d sec\n", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
 
-        printf("maximum resident set size: %ld kB\n",        usage.ru_maxrss);
-//        printf("integral shared memory size: %ld\n",      usage.ru_ixrss);
-//        printf("integral unshared data size: %ld\n",      usage.ru_idrss);
-//        printf("integral unshared stack size: %ld\n",     usage.ru_isrss);
-        printf("page reclaims (soft page faults): %ld\n", usage.ru_minflt);
-        printf("page faults (hard page faults): %ld\n",   usage.ru_majflt);
-//        printf("swaps: %ld\n",                            usage.ru_nswap);
-        printf("block input operations: %ld\n",           usage.ru_inblock);
-        printf("block output operations: %ld\n",          usage.ru_oublock);
-//        printf("IPC messages sent: %ld\n",                usage.ru_msgsnd);
-//        printf("IPC messages received: %ld\n",            usage.ru_msgrcv);
-//        printf("signals received: %ld\n",                 usage.ru_nsignals);
-        printf("voluntary context switches: %ld\n",       usage.ru_nvcsw);
-        printf("involuntary context switches: %ld\n",     usage.ru_nivcsw);
+            printf("maximum resident set size: %ld kB\n",        usage.ru_maxrss);
+//            printf("integral shared memory size: %ld\n",      usage.ru_ixrss);
+//            printf("integral unshared data size: %ld\n",      usage.ru_idrss);
+//            printf("integral unshared stack size: %ld\n",     usage.ru_isrss);
+            printf("page reclaims (soft page faults): %ld\n", usage.ru_minflt);
+            printf("page faults (hard page faults): %ld\n",   usage.ru_majflt);
+//            printf("swaps: %ld\n",                            usage.ru_nswap);
+            printf("block input operations: %ld\n",           usage.ru_inblock);
+            printf("block output operations: %ld\n",          usage.ru_oublock);
+//            printf("IPC messages sent: %ld\n",                usage.ru_msgsnd);
+//            printf("IPC messages received: %ld\n",            usage.ru_msgrcv);
+//            printf("signals received: %ld\n",                 usage.ru_nsignals);
+            printf("voluntary context switches: %ld\n",       usage.ru_nvcsw);
+            printf("involuntary context switches: %ld\n",     usage.ru_nivcsw);
+        }
     }
 
     return ret;
@@ -161,7 +167,7 @@ void add_history(const char *cmd){
     }
 
     // Store command
-    char *stor = malloc(strlen(cmd));
+    char *stor = malloc(strlen(cmd)+1);
     strcpy(stor, cmd);
     history[histlen++] = stor;
 }
@@ -257,6 +263,9 @@ int process(const char *input, int *status){
         getcwd(buffer, sizeof(buffer));
         printf("%s\n", buffer);
 
+    } else if(strcmp(cmd, "nodebug") == 0){
+        debug = 0;
+
     } else if(strcmp(cmd, "history") == 0){
         savehist = 0;
         for(int i = 0; i < histlen; ++i){
@@ -313,15 +322,8 @@ int process(const char *input, int *status){
     }
 
     if(savehist){
-        // format command for history
-        char cmdbuff[CMD_LEN_MAX];
-        cmdbuff[0] = 0;
-        for(int i = 0; i < argn; ++i){
-            strcat(cmdbuff, args[i]);
-            strcat(cmdbuff, " ");
-        }
-        cmdbuff[strlen(cmdbuff)-1] = 0;
-        add_history(cmdbuff);
+        // save command to history
+        add_history(input);
     }
 
     return ret;
@@ -380,7 +382,8 @@ int main(int argc, const char **argv){
             printf("Unknown Command\n");
         } else if(status == 3){
             // external command
-            printf("return: %d\n", ret);
+            if(debug)
+                printf("return: %d\n", ret);
         }
     }
 
