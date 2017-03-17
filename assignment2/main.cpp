@@ -3,64 +3,68 @@
 #include "zmutex.h"
 #include "zlock.h"
 #include "zworkqueue.h"
+#include "zpoolallocator.h"
+#include "zwrapallocator.h"
 using namespace LibChaos;
+
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <sys/mman.h>
 
 struct Job {
     int id;
+    bool exit;
 };
 
 struct Share {
-    ZMutex lock;
-    int total;
-    ZWorkQueue<Job> queue;
+    ZMutex *lock;
+    ZWorkQueue<Job> *queue;
 
+    int total;
     int arate;
     int srate;
 };
 
-class Producer : public ZThread::ZThreadContainer {
-public:
-    void *run(void *arg){
-        Share *share = (Share *)arg;
-        int atime = share->arate;
-        LOG("Producer start");
-        while(!stop()){
-            share->lock.lock();
-            if(share->total == 0){
-                share->lock.unlock();
-                break;
-            }
-            Job j = { share->total };
-            LOG("Queue " << j.id);
-            share->queue.addWork(j);
-            share->total--;
-            share->lock.unlock();
-            ZThread::msleep(atime);
+void runProducer(zu64 i, Share *share){
+    int atime = share->arate;
+    LOG("Producer " << i << " start");
+    while(true){
+        share->lock->lock();
+        if(share->total == 0){
+            share->lock->unlock();
+            break;
         }
-        LOG("Producer done");
-        return nullptr;
-    }
-};
 
-class Consumer : public ZThread::ZThreadContainer {
-public:
-    void *run(void *arg){
-        Share *share = (Share *)arg;
-        int stime = share->srate;
-        LOG("Consumer start");
-        while(!stop()){
-            Job j = share->queue.getWork();
-            LOG("Job " << j.id);
-            ZThread::msleep(stime);
-        }
-        LOG("Consumer done");
-        return nullptr;
+        Job j = { share->total, share->total == 1 };
+        LOG("Queue " << j.id);
+        share->queue->addWork(j);
+        share->total--;
+        share->lock->unlock();
+
+        if(share->total == 0)
+            break;
+        ZThread::msleep(atime);
     }
-};
+    LOG("Producer " << i << " done");
+}
+
+void runConsumer(zu64 i, Share *share){
+    int stime = share->srate;
+    LOG("Consumer " << i << " start");
+    while(true){
+        Job j = share->queue->getWork();
+        LOG("Job " << j.id);
+        ZThread::msleep(stime);
+        if(j.exit)
+            break;
+    }
+    LOG("Consumer " << i << " done");
+}
 
 int main(int argc, char **argv){
-    ZLog::logLevelStdOut(ZLog::INFO, "[%clock%] %thread% N %log%");
-    ZLog::logLevelStdErr(ZLog::ERRORS, "\x1b[31m[%clock%] %thread% E %log%\x1b[m");
+    ZLog::logLevelStdOut(ZLog::INFO, "[%clock%] %ppid% %pid% N %log%");
+    ZLog::logLevelStdErr(ZLog::ERRORS, "\x1b[31m[%clock%] %ppid% %pid% E %log%\x1b[m");
 
     int nproducer = 4;
     int nconsumer = 2;
@@ -69,42 +73,79 @@ int main(int argc, char **argv){
     int arate = 10;
     int srate = 10;
 
-    Share share;
-    share.total = requests;
-    share.arate = 1000 / arate;
-    share.srate = 1000 / srate;
+    const zu64 psize = 100 * 1024 * 1024;
+    void *pool = mmap(NULL, psize, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    if(pool == MAP_FAILED){
+        ELOG("map failed");
+        return -1;
+    }
 
-    ZArray<ZPointer<ZThread>> produce;
-    ZArray<ZPointer<ZThread>> consume;
+    ZMutex *lock = new ZMutex(ZMutex::PSHARE);
+
+    // pretty neat
+    ZAllocator<zbyte> *alloc = new ZPoolAllocator<zbyte>(pool, psize);
+
+    // oh god i'm sorry
+    ZAllocator<ZWorkQueue<Job>> *qalloc = new ZWrapAllocator<ZWorkQueue<Job>>(alloc);
+    ZAllocator<typename ZList<Job>::Node>*jalloc = new ZWrapAllocator<typename ZList<Job>::Node>(alloc);
+    ZAllocator<Share> *salloc = new ZWrapAllocator<Share>(alloc);
+
+    // actual black magic
+    ZWorkQueue<Job> *queue = qalloc->construct(qalloc->alloc(), 1, jalloc, ZCondition::PSHARE);
+
+
+    Share *share = salloc->construct(salloc->alloc(), 1);
+    share->lock = lock;
+    share->queue = queue;
+    share->total = requests;
+    share->arate = 1000 / arate;
+    share->srate = 1000 / srate;
 
     LOG("Producers: " << nproducer << ", Consumers: " << nconsumer);
-    LOG("Arrival Rate: " << share.arate << " ms, Service Rate: " << share.srate << " ms");
+    LOG("Arrival Rate: " << share->arate << " ms, Service Rate: " << share->srate << " ms");
 
     // start producers
     for(int i = 0; i < nproducer; ++i){
-        ZPointer<ZThread> thr = new ZThread(new Producer);
-        thr->exec(&share);
-        produce.push(thr);
+        pid_t pid = fork();
+        if(pid == 0){
+            LOG("Start producer " << i);
+            runProducer(i, share);
+            return 0;
+        } else if(pid == -1){
+            ELOG("Fork error " << errno << " " << strerror(errno));
+        }
     }
     // start consumers
     for(int i = 0; i < nconsumer; ++i){
-        ZPointer<ZThread> thr = new ZThread(new Consumer);
-        thr->exec(&share);
-        consume.push(thr);
+        pid_t pid = fork();
+        if(pid == 0){
+            LOG("Start consumer  " << i);
+            runConsumer(i, share);
+            return 0;
+        } else if(pid == -1){
+            ELOG("Fork error " << errno << " " << strerror(errno));
+        }
     }
 
-    // wait for producers
-    for(zu64 i = 0; i < produce.size(); ++i){
-        produce[i]->join();
+    // wait for all child processes
+    while(true){
+        wait(NULL);
+        if(errno == ECHILD)
+            break;
     }
-    // stop consumers
-    for(zu64 i = 0; i < consume.size(); ++i){
-        consume[i]->stop();
-    }
-    // wait for consumers
-    for(zu64 i = 0; i < consume.size(); ++i){
-        consume[i]->join();
-    }
+
+    LOG("Done Waiting");
+
+    salloc->destroy(share);
+    salloc->dealloc(share);
+
+    delete lock;
+
+    qalloc->destroy(queue);
+    qalloc->dealloc(queue);
+
+    delete jalloc;
+    delete qalloc;
 
     return 0;
 }
