@@ -32,11 +32,13 @@ void runProducer(int num, Share *share){
     zu32 atime = share->arate;
     LOG("Producer " <<  num << " start");
 
+    ZClock clock;
     zu64 count = 0;
     bool run = true;
     while(run){
         share->lock->lock();
 
+        // check remaining jobs
         if(share->total)
             share->total--;
         else
@@ -48,25 +50,26 @@ void runProducer(int num, Share *share){
 
         if(run){
             DLOG("Queue " << id);
-            Job j = { id, false };
-            share->queue->addWork(j);
+            // delay before adding each job
+            ZThread::usleep(atime);
+            share->queue->addWork({ id, false });
             ++count;
 
-            if(id){
-                ZThread::msleep(atime);
-            } else {
+            if(!id){
+                // After the last job, add the exit job
                 DLOG("Queue Exit");
                 share->queue->addWork({ 0, true });
             }
         }
     }
-    LOG("Producer " << num << " done: " << count << " jobs");
+    LOG("Producer " << num << " done: " << count << " jobs, " << clock.str());
 }
 
 void runConsumer(int num, Share *share){
     zu32 stime = share->srate;
     LOG("Consumer " << num << " start");
 
+    ZClock clock;
     zu64 count = 0;
     bool run = true;
     while(run){
@@ -74,19 +77,17 @@ void runConsumer(int num, Share *share){
 
         if(j.exit){
             DLOG("Exit Job");
+            // Duplicate the exit job for other consumers
             share->queue->addWork(j);
             run = false;
         } else {
             DLOG("Job " << j.id);
+            // do the job's "work"
+            ZThread::usleep(stime);
             ++count;
         }
-
-        if(run){
-            ZThread::msleep(stime);
-        }
-
     }
-    LOG("Consumer " << num << " done: " << count << " jobs");
+    LOG("Consumer " << num << " done: " << count << " jobs, " << clock.str());
 }
 
 #define OPT_DBG "debug"
@@ -117,13 +118,21 @@ int main(int argc, char **argv){
 
     LOG("Producers: " << nproducer << ", Consumers: " << nconsumer);
     LOG("Requests: " << requests);
-    LOG("Arrival Rate: " << arate << " / sec, Service Rate: " << srate << " / sec");
+    LOG("Arrival Rate: " << arate << " requests/second, Service Rate: " << srate << " requests/second");
 
-    /* Allocate 100 MiB shared memory. This is cheap, and could be much larger.
+    /* Allocate shared memory. This is cheap, and could be much larger than the needed size.
      * Pages in anonymous memory mappings are "initialized" to zero, but are not allocated until
      * the page is written.
+     * Size is calculated from the expected allocations, then doubled to be safe.
      */
-    const zu64 psize = 100 * 1024 * 1024;
+    const zu64 psize = (
+                sizeof(Share) + 16 +
+                sizeof(ZMutex) + 16 +
+                sizeof(ZWorkQueue<Job>) + 16 +
+                (requests * (sizeof(ZList<Job>::Node) + 16)) +
+                16
+                ) * 2;
+    LOG("Allocate " << psize << " bytes shared memory");
     void *pool = mmap(NULL, psize, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
     if(pool == MAP_FAILED){
         ELOG("map failed");
@@ -150,8 +159,10 @@ int main(int argc, char **argv){
     share->queue = qalloc->construct(qalloc->alloc(), 1, jalloc, ZCondition::PSHARE);
 
     share->total = (zu64)requests;
-    share->arate = (zu32)(1000 / arate);
-    share->srate = (zu32)(1000 / srate);
+    share->arate = (zu32)(1000000 / arate);
+    share->srate = (zu32)(1000000 / srate);
+
+    ZClock clock;
 
     // start producers
     for(int i = 0; i < nproducer; ++i){
@@ -206,7 +217,7 @@ int main(int argc, char **argv){
             break;
     }
 
-    LOG("Workers Finished");
+    LOG("Workers Finished: " << clock.str());
 
     // lock allocator
     lalloc->destroy(share->lock);
