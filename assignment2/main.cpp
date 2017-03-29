@@ -4,6 +4,8 @@
 #include "zlock.h"
 #include "zworkqueue.h"
 #include "zoptions.h"
+#include "zclock.h"
+#include "zrandom.h"
 #include "zpoolallocator.h"
 #include "zwrapallocator.h"
 using namespace LibChaos;
@@ -17,26 +19,36 @@ using namespace LibChaos;
 struct Job {
     int id;
     bool exit;
+    ZClock clock;
 };
 
 struct Share {
-    ZMutex *lock;
-    ZWorkQueue<Job> *queue;
-
-    zu64 total;
     zu32 arate;
     zu32 srate;
+
+    ZWorkQueue<Job> *queue;
+
+    // producer mutex and fields
+    ZMutex *prlock;
+    zu64 total;
+
+    // consumer mutex and fields
+    ZMutex *cslock;
+    double time;
+    zu64 weight;
 };
 
 void runProducer(int num, Share *share){
     zu32 atime = share->arate;
     LOG("Producer " <<  num << " start");
 
+    ZRandom random;
     ZClock clock;
+
     zu64 count = 0;
     bool run = true;
     while(run){
-        share->lock->lock();
+        share->prlock->lock();
 
         // check remaining jobs
         if(share->total)
@@ -46,30 +58,33 @@ void runProducer(int num, Share *share){
 
         int id = share->total;
 
-        share->lock->unlock();
+        share->prlock->unlock();
 
         if(run){
-            DLOG("Queue " << id);
-            // delay before adding each job
-            ZThread::usleep(atime);
-            share->queue->addWork({ id, false });
+            zu32 rtime = random.genzu(0, 2 * atime);
+            DLOG("Queue " << id << ": " << rtime);
+            // delay random time before adding each job
+            ZThread::usleep(rtime);
+            share->queue->addWork({ id, false, ZClock() });
             ++count;
 
             if(!id){
                 // After the last job, add the exit job
                 DLOG("Queue Exit");
-                share->queue->addWork({ 0, true });
+                share->queue->addWork({ 0, true, ZClock() });
             }
         }
     }
-    LOG("Producer " << num << " done: " << count << " jobs, " << clock.str());
+    LOG("Producer " << num << " done: " << count << " jobs, " << clock.getSecs() << " seconds");
 }
 
 void runConsumer(int num, Share *share){
     zu32 stime = share->srate;
     LOG("Consumer " << num << " start");
 
+    ZRandom random;
     ZClock clock;
+
     zu64 count = 0;
     bool run = true;
     while(run){
@@ -81,13 +96,26 @@ void runConsumer(int num, Share *share){
             share->queue->addWork(j);
             run = false;
         } else {
-            DLOG("Job " << j.id);
+            zu32 rtime = random.genzu(0, 2 * stime);
             // do the job's "work"
-            ZThread::usleep(stime);
+            ZThread::usleep(rtime);
             ++count;
+            j.clock.stop();
+            DLOG("Job " << j.id << ": " << rtime << ", " << j.clock.str());
+
+            double sec = j.clock.getSecs();
+
+            share->cslock->lock();
+
+            // update average job time
+            share->time += sec;
+//            share->time = ((share->time * share->weight) + sec) / (share->weight + 1);
+            share->weight += 1;
+
+            share->cslock->unlock();
         }
     }
-    LOG("Consumer " << num << " done: " << count << " jobs, " << clock.str());
+    LOG("Consumer " << num << " done: " << count << " jobs, " << clock.getSecs() << " seconds");
 }
 
 #define OPT_DBG "debug"
@@ -105,12 +133,13 @@ int main(int argc, char **argv){
         return EXIT_FAILURE;
     }
 
-    int nproducer = options.getArgs()[0].tint();
-    int nconsumer = options.getArgs()[1].tint();
+    unsigned nproducer = options.getArgs()[0].toUint();
+    unsigned nconsumer = options.getArgs()[1].toUint();
 
-    int requests = options.getArgs()[2].tint();
-    int arate = options.getArgs()[3].tint();
-    int srate = options.getArgs()[4].tint();
+    zu64 requests = options.getArgs()[2].toUint();
+
+    float arate = options.getArgs()[3].toFloat();
+    float srate = options.getArgs()[4].toFloat();
 
     if(options.getOpts().contains(OPT_DBG)){
         ZLog::logLevelStdOut(ZLog::DEBUG, "[%clock%] %pid% D %log%");
@@ -129,7 +158,7 @@ int main(int argc, char **argv){
                 sizeof(Share) + 16 +
                 sizeof(ZMutex) + 16 +
                 sizeof(ZWorkQueue<Job>) + 16 +
-                (requests * (sizeof(ZList<Job>::Node) + 16)) +
+                ((sizeof(ZList<Job>::Node) + 16) * requests) +
                 16
                 ) * 2;
     LOG("Allocate " << psize << " bytes shared memory");
@@ -155,17 +184,20 @@ int main(int argc, char **argv){
 
     // Allocate shared data structures on the shared memory pool
     Share *share = salloc->construct(salloc->alloc(), 1);
-    share->lock = lalloc->construct(lalloc->alloc(), 1, ZMutex::PSHARE);
     share->queue = qalloc->construct(qalloc->alloc(), 1, jalloc, ZCondition::PSHARE);
+    share->prlock = lalloc->construct(lalloc->alloc(), 1, ZMutex::PSHARE);
+    share->cslock = lalloc->construct(lalloc->alloc(), 1, ZMutex::PSHARE);
 
+    share->arate = (zu32)(1000000.0f / arate);
+    share->srate = (zu32)(1000000.0f / srate);
     share->total = (zu64)requests;
-    share->arate = (zu32)(1000000 / arate);
-    share->srate = (zu32)(1000000 / srate);
+    share->time = 0;
+    share->weight = 0;
 
     ZClock clock;
 
     // start producers
-    for(int i = 0; i < nproducer; ++i){
+    for(unsigned i = 0; i < nproducer; ++i){
         int num = (int)i;
         DLOG("Fork producer " << num);
         pid_t pid = fork();
@@ -188,7 +220,7 @@ int main(int argc, char **argv){
     }
 
     // start consumers
-    for(int i = 0; i < nconsumer; ++i){
+    for(unsigned i = 0; i < nconsumer; ++i){
         int num = (int)i;
         DLOG("Fork consumer " << num);
         pid_t pid = fork();
@@ -217,11 +249,15 @@ int main(int argc, char **argv){
             break;
     }
 
-    LOG("Workers Finished: " << clock.str());
+    LOG("Workers Finished: " << clock.getSecs() << " seconds");
+    LOG("Total Request Time: " << share->time << " sec");
+    LOG("Average Request Latency: " << share->time / share->weight << " sec");
 
     // lock allocator
-    lalloc->destroy(share->lock);
-    lalloc->dealloc(share->lock);
+    lalloc->destroy(share->cslock);
+    lalloc->dealloc(share->cslock);
+    lalloc->destroy(share->prlock);
+    lalloc->dealloc(share->prlock);
     delete lalloc;
 
     // queue allocator
