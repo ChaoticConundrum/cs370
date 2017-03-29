@@ -19,6 +19,7 @@ using namespace LibChaos;
 struct Job {
     int id;
     bool exit;
+    double qtime;
     ZClock clock;
 };
 
@@ -34,8 +35,10 @@ struct Share {
 
     // consumer mutex and fields
     ZMutex *cslock;
-    double time;
-    zu64 weight;
+    double qtime;
+    zu64 qweight;
+    double ttime;
+    zu64 tweight;
 };
 
 void runProducer(int num, Share *share){
@@ -61,17 +64,18 @@ void runProducer(int num, Share *share){
         share->prlock->unlock();
 
         if(run){
+            ZClock qclock;
             zu32 rtime = random.genzu(0, 2 * atime);
             DLOG("Queue " << id << ": " << rtime);
             // delay random time before adding each job
             ZThread::usleep(rtime);
-            share->queue->addWork({ id, false, ZClock() });
+            share->queue->addWork({ id, false, qclock.getSecs(), qclock });
             ++count;
 
             if(!id){
                 // After the last job, add the exit job
                 DLOG("Queue Exit");
-                share->queue->addWork({ 0, true, ZClock() });
+                share->queue->addWork({ 0, true, 0, ZClock() });
             }
         }
     }
@@ -99,18 +103,18 @@ void runConsumer(int num, Share *share){
             zu32 rtime = random.genzu(0, 2 * stime);
             // do the job's "work"
             ZThread::usleep(rtime);
+            double sec = j.clock.getSecs();
             ++count;
             j.clock.stop();
             DLOG("Job " << j.id << ": " << rtime << ", " << j.clock.str());
 
-            double sec = j.clock.getSecs();
-
             share->cslock->lock();
 
-            // update average job time
-            share->time += sec;
-//            share->time = ((share->time * share->weight) + sec) / (share->weight + 1);
-            share->weight += 1;
+            // update timing data
+            share->qtime += j.qtime;
+            share->qweight += 1;
+            share->ttime += sec;
+            share->tweight += 1;
 
             share->cslock->unlock();
         }
@@ -191,8 +195,11 @@ int main(int argc, char **argv){
     share->arate = (zu32)(1000000.0f / arate);
     share->srate = (zu32)(1000000.0f / srate);
     share->total = (zu64)requests;
-    share->time = 0;
-    share->weight = 0;
+
+    share->qtime = 0;
+    share->qweight = 0;
+    share->ttime = 0;
+    share->tweight = 0;
 
     ZClock clock;
 
@@ -249,9 +256,23 @@ int main(int argc, char **argv){
             break;
     }
 
+    // Real world time from producers and consumers starting to all processes finishing
     LOG("Workers Finished: " << clock.getSecs() << " seconds");
-    LOG("Total Request Time: " << share->time << " sec");
-    LOG("Average Request Latency: " << share->time / share->weight << " sec");
+
+    /* Queue times are measured from when the request count is decremented by the producer to
+     * when the job is put on the work queue.
+     */
+    LOG("Average Queue Time: " << share->qtime / share->qweight << " sec");
+
+    /* Request latency is measured from when the request count is decremented by the producer to
+     * to when the job is finished by the consumer.
+     */
+    LOG("Average Request Latency: " << share->ttime / share->tweight << " sec");
+
+    /* Total sum request time is the total request latency from all jobs. This is not the same as CPU
+     * time spent, because the "work" done by the processes is mostly sleeping.
+     */
+    LOG("Total Sum Request Time: " << share->ttime << " sec");
 
     // lock allocator
     lalloc->destroy(share->cslock);
