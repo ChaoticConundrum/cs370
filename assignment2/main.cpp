@@ -30,8 +30,7 @@ struct Share {
 
 void runProducer(int num, Share *share){
     int atime = share->arate;
-    printf("%d producer start\n", num);
-//    LOG("Producer " << i << " start");
+    LOG("Producer " <<  num << " start");
     bool run = true;
     while(run){
         share->lock->lock();
@@ -47,26 +46,26 @@ void runProducer(int num, Share *share){
 
         if(run){
             Job j = { id, !id };
-            printf("%d queue %d\n", num, j.id);
-//            LOG("Queue " << j.id);
+//            printf("%d queue %d\n", num, j.id);
+            LOG("Queue " << j.id);
             share->queue->addWork(j);
 
             ZThread::msleep(atime);
         }
     }
-    printf("%d producer done\n", num);
-//    LOG("Producer " << i << " done");
+//    printf("%d producer done\n", num);
+    LOG("Producer " << num << " done");
 }
 
 void runConsumer(int num, Share *share){
     int stime = share->srate;
-    printf("%d consumer start\n", num);
-//    LOG("Consumer " << i << " start");
+//    printf("%d consumer start\n", num);
+    LOG("Consumer " << num << " start");
     bool run = true;
     while(run){
         Job j = share->queue->getWork();
-//        LOG("Job " << j.id);
-        printf("%d job %d\n", num, j.id);
+        LOG("Job " << j.id);
+//        printf("%d job %d\n", num, j.id);
 
         if(j.exit){
             share->queue->addWork(j);
@@ -76,8 +75,8 @@ void runConsumer(int num, Share *share){
         if(run)
             ZThread::msleep(stime);
     }
-    printf("%d consumer done\n", num);
-//    LOG("Consumer " << i << " done");
+//    printf("%d consumer done\n", num);
+    LOG("Consumer " << num << " done");
 }
 
 #define OPT_DBG "debug"
