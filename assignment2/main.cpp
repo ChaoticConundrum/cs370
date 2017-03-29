@@ -23,14 +23,16 @@ struct Share {
     ZMutex *lock;
     ZWorkQueue<Job> *queue;
 
-    int total;
-    int arate;
-    int srate;
+    zu64 total;
+    zu32 arate;
+    zu32 srate;
 };
 
 void runProducer(int num, Share *share){
-    int atime = share->arate;
+    zu32 atime = share->arate;
     LOG("Producer " <<  num << " start");
+
+    zu64 count = 0;
     bool run = true;
     while(run){
         share->lock->lock();
@@ -45,38 +47,46 @@ void runProducer(int num, Share *share){
         share->lock->unlock();
 
         if(run){
-            Job j = { id, !id };
-//            printf("%d queue %d\n", num, j.id);
-            LOG("Queue " << j.id);
+            DLOG("Queue " << id);
+            Job j = { id, false };
             share->queue->addWork(j);
+            ++count;
 
-            ZThread::msleep(atime);
+            if(id){
+                ZThread::msleep(atime);
+            } else {
+                DLOG("Queue Exit");
+                share->queue->addWork({ 0, true });
+            }
         }
     }
-//    printf("%d producer done\n", num);
-    LOG("Producer " << num << " done");
+    LOG("Producer " << num << " done: " << count << " jobs");
 }
 
 void runConsumer(int num, Share *share){
-    int stime = share->srate;
-//    printf("%d consumer start\n", num);
+    zu32 stime = share->srate;
     LOG("Consumer " << num << " start");
+
+    zu64 count = 0;
     bool run = true;
     while(run){
         Job j = share->queue->getWork();
-        LOG("Job " << j.id);
-//        printf("%d job %d\n", num, j.id);
 
         if(j.exit){
+            DLOG("Exit Job");
             share->queue->addWork(j);
             run = false;
+        } else {
+            DLOG("Job " << j.id);
+            ++count;
         }
 
-        if(run)
+        if(run){
             ZThread::msleep(stime);
+        }
+
     }
-//    printf("%d consumer done\n", num);
-    LOG("Consumer " << num << " done");
+    LOG("Consumer " << num << " done: " << count << " jobs");
 }
 
 #define OPT_DBG "debug"
@@ -101,10 +111,18 @@ int main(int argc, char **argv){
     int arate = options.getArgs()[3].tint();
     int srate = options.getArgs()[4].tint();
 
+    if(options.getOpts().contains(OPT_DBG)){
+        ZLog::logLevelStdOut(ZLog::DEBUG, "[%clock%] %pid% D %log%");
+    }
+
     LOG("Producers: " << nproducer << ", Consumers: " << nconsumer);
     LOG("Requests: " << requests);
-    LOG("Arrival Rate: " << arate << " / s, Service Rate: " << srate << " / s");
+    LOG("Arrival Rate: " << arate << " / sec, Service Rate: " << srate << " / sec");
 
+    /* Allocate 100 MiB shared memory. This is cheap, and could be much larger.
+     * Pages in anonymous memory mappings are "initialized" to zero, but are not allocated until
+     * the page is written.
+     */
     const zu64 psize = 100 * 1024 * 1024;
     void *pool = mmap(NULL, psize, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
     if(pool == MAP_FAILED){
@@ -112,33 +130,39 @@ int main(int argc, char **argv){
         return -1;
     }
 
-    // pretty neat
+    /* Pool allocator over shared memory pool. Allocation metadata is stored in the pool, so
+     * this allocator structure can be safely copied by a fork() after this point.
+     */
     ZAllocator<zbyte> *alloc = new ZPoolAllocator<zbyte>(pool, psize);
 
-    // oh god i'm sorry
+    /* Wrapper allocators use the pool byte allocator to allocate differently sized types.
+     * Slightly better than multiple pool allocators on the same pool.
+     */
     ZAllocator<Share> *salloc = new ZWrapAllocator<Share>(alloc);
     ZAllocator<ZMutex> *lalloc = new ZWrapAllocator<ZMutex>(alloc);
     ZAllocator<ZWorkQueue<Job>> *qalloc = new ZWrapAllocator<ZWorkQueue<Job>>(alloc);
     // job allocator for queue
     ZAllocator<typename ZList<Job>::Node> *jalloc = new ZWrapAllocator<typename ZList<Job>::Node>(alloc);
 
-    // actual black magic
+    // Allocate shared data structures on the shared memory pool
     Share *share = salloc->construct(salloc->alloc(), 1);
     share->lock = lalloc->construct(lalloc->alloc(), 1, ZMutex::PSHARE);
     share->queue = qalloc->construct(qalloc->alloc(), 1, jalloc, ZCondition::PSHARE);
 
-    share->total = requests;
-    share->arate = 1000 / arate;
-    share->srate = 1000 / srate;
+    share->total = (zu64)requests;
+    share->arate = (zu32)(1000 / arate);
+    share->srate = (zu32)(1000 / srate);
 
     // start producers
     for(int i = 0; i < nproducer; ++i){
         int num = (int)i;
-        LOG("Fork producer " << num);
+        DLOG("Fork producer " << num);
         pid_t pid = fork();
         if(pid == 0){
+            // In producer child process
             runProducer(num, share);
 
+            // Allocators are copied, delete the child process copies
             delete lalloc;
             delete qalloc;
             delete salloc;
@@ -151,14 +175,17 @@ int main(int argc, char **argv){
             ELOG("Fork error " << errno << " " << strerror(errno));
         }
     }
+
     // start consumers
     for(int i = 0; i < nconsumer; ++i){
         int num = (int)i;
-        LOG("Fork consumer " << num);
+        DLOG("Fork consumer " << num);
         pid_t pid = fork();
         if(pid == 0){
+            // In consumer child process
             runConsumer(num, share);
 
+            // Allocators are copied, delete the child process copies
             delete lalloc;
             delete qalloc;
             delete salloc;
@@ -177,10 +204,9 @@ int main(int argc, char **argv){
         wait(NULL);
         if(errno == ECHILD)
             break;
-        LOG("Child Finished");
     }
 
-    LOG("Done Waiting");
+    LOG("Workers Finished");
 
     // lock allocator
     lalloc->destroy(share->lock);
@@ -191,13 +217,15 @@ int main(int argc, char **argv){
     qalloc->destroy(share->queue);
     qalloc->dealloc(share->queue);
     delete qalloc;
-//    delete jalloc;
 
     salloc->destroy(share);
     salloc->dealloc(share);
     delete salloc;
 
     delete alloc;
+
+    // optional, unmap shared pool
+    munmap(pool, psize);
 
     return 0;
 }
