@@ -50,11 +50,11 @@
 #include <sys/xattr.h>
 #endif
 
-#define RFS_DATA ((struct rulefs_data *)fuse_get_context()->private_data)
-
 struct rulefs_data {
     const char *rootparam;
 };
+
+#define RFS_DATA ((struct rulefs_data *)fuse_get_context()->private_data)
 
 static void *rfs_init(struct fuse_conn_info *conn,
                       struct fuse_config *cfg)
@@ -73,7 +73,9 @@ static void *rfs_init(struct fuse_conn_info *conn,
     cfg->attr_timeout = 0;
     cfg->negative_timeout = 0;
 
-    return NULL;
+    // Need to return fuse_get_context()->private_data from here,
+    // so it will be filled in future fuse_get_context() calls?
+    return RFS_DATA;
 }
 
 static int rfs_getattr(const char *path, struct stat *stbuf,
@@ -86,7 +88,7 @@ static int rfs_getattr(const char *path, struct stat *stbuf,
     strcpy(mpath, RFS_DATA->rootparam);
     strcat(mpath, path);
 
-    printf("%s: %s\n", __FUNCTION__, mpath);
+//    printf("%s: %s\n", __FUNCTION__, mpath);
 
     res = lstat(mpath, stbuf);
     if (res == -1)
@@ -103,7 +105,7 @@ static int rfs_access(const char *path, int mask)
     strcpy(mpath, RFS_DATA->rootparam);
     strcat(mpath, path);
 
-    printf("%s: %s\n", __FUNCTION__, mpath);
+//    printf("%s: %s\n", __FUNCTION__, mpath);
 
     res = access(mpath, mask);
     if (res == -1)
@@ -157,6 +159,11 @@ static int rfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         memset(&st, 0, sizeof(st));
         st.st_ino = de->d_ino;
         st.st_mode = de->d_type << 12;
+
+        if(strcmp(de->d_name, ".Rulefile") == 0){
+            printf("name: %s\n", de->d_name);
+        }
+
         if (filler(buf, de->d_name, &st, 0, 0))
             break;
     }
@@ -669,7 +676,6 @@ int main(int argc, char **argv){
         argv[argc-2] = argv[argc-1];
         argv[argc-1] = NULL;
         argc--;
-
 
 //        struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 //        fuse_opt_parse(&args, rfs_data, NULL, opt_proc);
