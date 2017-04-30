@@ -1,6 +1,6 @@
 [submodule "assignment2/libchaos"]
 	path = assignment2/libchaos
 	url = https://github.com/ChaoticConundrum/libchaos.git
-[submodule "final/libchaos"]
-	path = final/libchaos
+[submodule "final/fuse/libchaos"]
+	path = final/fuse/libchaos
 	url = ssh://veralez/git/libchaos.git
