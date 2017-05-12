@@ -1,5 +1,5 @@
 
-obj-m += treefs.o super.o inode.o
+obj-m += treefs.o parcel.o
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build/ M=$(PWD) modules

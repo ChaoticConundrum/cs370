@@ -3,10 +3,12 @@ PROJECT("CS370 Final LKM")
 
 SET(SOURCES
     Makefile
+    parcel.h
+    parcel.c
     treefs.h
     treefs.c
-    super.c
-    inode.c
+    #super.c
+    #inode.c
 )
 
 INCLUDE_DIRECTORIES(
